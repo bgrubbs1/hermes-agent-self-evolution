@@ -75,6 +75,22 @@ Every evolved variant must pass:
 4. **Semantic preservation** — Must not drift from original purpose
 5. **PR review** — All changes go through human review, never direct commit
 
+## Contest calibration
+
+`evolution.contests` is a dependency-free toolkit for agents that enter skill contests. It provides:
+
+- base-rate win probabilities (no hand-set defaults);
+- a receipt-gated outcome ledger;
+- predicted-vs-actual calibration;
+- blind judge panels with a validity gate;
+- robustness claims with intervals.
+
+The matching Hermes skill is `skills/contest-calibration/SKILL.md`. See [docs/CONTEST_CALIBRATION.md](docs/CONTEST_CALIBRATION.md).
+
+```bash
+python -m evolution.contests.cli predict --ledger ledger.jsonl --contest-id demo --prizes 3 --entrants 1200 --dry-run
+```
+
 ## Full Plan
 
 See [PLAN.md](PLAN.md) for the complete architecture, evaluation data strategy, constraints, benchmarks integration, and phased timeline.
