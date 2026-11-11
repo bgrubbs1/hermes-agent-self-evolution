@@ -87,7 +87,7 @@ class TestEstimate:
 
     def test_sweepstakes_ignore_skill(self):
         skill = fit_skill_offset([(0.02, True)] * 9)
-        est = estimate_win_probability(ContestField("sw", prizes=1, entrants=10_000, skill_based=False), skill)
+        est = estimate_win_probability(ContestField("sw", prizes=1, entrants=10_000, kind="sweepstakes"), skill)
         assert est.p_mean == pytest.approx(1e-4)
         assert est.evidence_class == "chance_only"
 
@@ -102,7 +102,7 @@ class TestEstimate:
     def test_manual_shift_refused_for_chance(self):
         with pytest.raises(ValueError):
             estimate_win_probability(
-                ContestField("sw", prizes=1, entrants=100, skill_based=False), manual_shift=1, manual_reason="x"
+                ContestField("sw", prizes=1, entrants=100, kind="sweepstakes"), manual_shift=1, manual_reason="x"
             )
 
     def test_ev_per_hour(self):

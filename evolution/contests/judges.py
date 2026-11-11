@@ -123,32 +123,26 @@ def find_leaks(artifacts: Sequence[Artifact], forbidden_terms: Sequence[str] = (
     return leaks
 
 
-def make_blind_batch(
-    entry: Artifact,
-    references: Sequence[Artifact],
+def _build_batch(
+    artifacts: Sequence[Artifact],
     judges: Sequence[JudgeSpec],
     *,
     rubric: str,
     criteria: Sequence[str],
-    seed: Optional[int] = None,
-    forbidden_terms: Sequence[str] = (),
+    seed: Optional[int],
+    forbidden_terms: Sequence[str],
 ) -> BlindBatch:
-    if entry.role != "entry":
-        raise ValueError("entry must have role 'entry'")
-    if any(r.role == "entry" for r in references):
-        raise ValueError("references must be winners, entrants or controls")
     if not judges:
         raise ValueError("at least one judge is required")
     if not criteria:
         raise ValueError("at least one criterion is required")
-    ids = [entry.artifact_id] + [r.artifact_id for r in references]
+    ids = [a.artifact_id for a in artifacts]
     if len(set(ids)) != len(ids):
         raise ValueError("artifact ids must be unique")
     judge_ids = [j.judge_id for j in judges]
     if len(set(judge_ids)) != len(judge_ids):
         raise ValueError("judge ids must be unique")
 
-    artifacts = [entry, *references]
     leaks = find_leaks(artifacts, forbidden_terms)
     if leaks:
         detail = "; ".join(f"{aid}: {', '.join(hits)}" for aid, hits in sorted(leaks.items()))
@@ -178,6 +172,25 @@ def make_blind_batch(
         key=key,
         roles={a.artifact_id: a.role for a in artifacts},
         criteria=tuple(criteria),
+    )
+
+
+def make_blind_batch(
+    entry: Artifact,
+    references: Sequence[Artifact],
+    judges: Sequence[JudgeSpec],
+    *,
+    rubric: str,
+    criteria: Sequence[str],
+    seed: Optional[int] = None,
+    forbidden_terms: Sequence[str] = (),
+) -> BlindBatch:
+    if entry.role != "entry":
+        raise ValueError("entry must have role 'entry'")
+    if any(r.role == "entry" for r in references):
+        raise ValueError("references must be winners, entrants or controls")
+    return _build_batch(
+        [entry, *references], judges, rubric=rubric, criteria=criteria, seed=seed, forbidden_terms=forbidden_terms
     )
 
 
@@ -434,3 +447,123 @@ def split_judges(
         for j in pool[n_holdout:]
     ]
     return optimise, holdout
+
+
+# -- backtesting on past contests --------------------------------------------
+
+
+@dataclass(frozen=True)
+class PastContest:
+    """A finished contest with published winners: winners + typical entrants, no entry of ours."""
+
+    contest_id: str
+    rubric: str
+    artifacts: tuple[Artifact, ...]
+
+    def __post_init__(self) -> None:
+        roles = {a.role for a in self.artifacts}
+        if not roles <= {"winner", "entrant"}:
+            raise ValueError("past contests hold only winners and entrants")
+        if "winner" not in roles or "entrant" not in roles:
+            raise ValueError("need at least one winner and one entrant")
+
+
+@dataclass
+class BacktestResult:
+    n_contests: int
+    per_contest_auc: dict[str, float]
+    mean_auc: float
+    auc_ci: tuple[float, float]
+    top1_hit_rate: float  # panel's top-scored item was a real winner
+    top1_chance: float  # expected hit rate from picking at random
+    evidence_class: str
+    valid: bool
+    reasons: list[str]
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def to_markdown(self) -> str:
+        status = "VALID" if self.valid else "NOT VALID"
+        lines = [
+            f"## Judge panel backtest ({status})",
+            "",
+            f"- {self.n_contests} past contests; evidence class {self.evidence_class}",
+            f"- Winner-vs-entrant AUC {self.mean_auc:.3f} (95% bootstrap over contests "
+            f"{self.auc_ci[0]:.3f}-{self.auc_ci[1]:.3f}; 0.5 = coin flip)",
+            f"- Top pick was a real winner in {self.top1_hit_rate:.0%} of contests "
+            f"(random picking: {self.top1_chance:.0%})",
+        ]
+        if self.reasons:
+            lines += ["", "**Why not valid**", ""] + [f"- {r}" for r in self.reasons]
+        return "\n".join(lines) + "\n"
+
+
+def backtest_panel(
+    contests: Sequence[PastContest],
+    judges: Sequence[JudgeSpec],
+    judge_fn: JudgeFn,
+    *,
+    criteria: Sequence[str],
+    weights: Optional[dict[str, float]] = None,
+    min_contests: int = 5,
+    bootstrap: int = 2000,
+    seed: int = 0,
+    forbidden_terms: Sequence[str] = (),
+) -> BacktestResult:
+    """Measure, on contests that already resolved, whether this panel can find the winners.
+
+    This is calibration that does not wait for our own results: every past
+    contest with a published winners list is a test case available today.
+    """
+    if not contests:
+        raise ValueError("no past contests")
+    weights = weights or {c: 1.0 for c in criteria}
+    wsum = sum(weights[c] for c in criteria)
+    rng = random.Random(seed)
+    per_auc: dict[str, float] = {}
+    hits, chance = 0.0, 0.0
+    for contest in contests:
+        batch = _build_batch(
+            contest.artifacts, judges, rubric=contest.rubric, criteria=criteria,
+            seed=rng.getrandbits(64), forbidden_terms=forbidden_terms,
+        )
+        scores = run_panel(batch, judge_fn)
+        means = {
+            a.artifact_id: sum(
+                sum(weights[c] * scores[j.judge_id][a.artifact_id][c] for c in criteria) / wsum for j in judges
+            ) / len(judges)
+            for a in contest.artifacts
+        }
+        winners = [a.artifact_id for a in contest.artifacts if a.role == "winner"]
+        entrants = [a.artifact_id for a in contest.artifacts if a.role == "entrant"]
+        per_auc[contest.contest_id] = _auc([means[w] for w in winners], [means[e] for e in entrants])
+        best = max(means.values())
+        top = [aid for aid, m in means.items() if m == best]
+        hits += sum(1 for aid in top if aid in winners) / len(top)
+        chance += len(winners) / len(contest.artifacts)
+
+    aucs = list(per_auc.values())
+    boots = sorted(
+        sum(aucs[rng.randrange(len(aucs))] for _ in aucs) / len(aucs) for _ in range(max(1, bootstrap))
+    )
+    ci = (boots[int(0.025 * (len(boots) - 1))], boots[int(0.975 * (len(boots) - 1))])
+    ev = evidence_class(judges)
+    reasons = []
+    if ev in ("self_graded", "optimization_contaminated"):
+        reasons.append(f"evidence class {ev}")
+    if len(contests) < min_contests:
+        reasons.append(f"only {len(contests)} past contests (< {min_contests})")
+    if ci[0] <= 0.5:
+        reasons.append("AUC interval includes 0.5: the panel is not reliably better than chance")
+    return BacktestResult(
+        n_contests=len(contests),
+        per_contest_auc=per_auc,
+        mean_auc=sum(aucs) / len(aucs),
+        auc_ci=ci,
+        top1_hit_rate=hits / len(contests),
+        top1_chance=chance / len(contests),
+        evidence_class=ev,
+        valid=not reasons,
+        reasons=reasons,
+    )

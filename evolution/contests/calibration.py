@@ -80,12 +80,13 @@ def calibration_report(
     n_bins: int = 5,
     min_n: int = MIN_RESOLVED_FOR_SIGNAL,
 ) -> CalibrationReport:
-    resolved = list(resolved)
+    # Only contests forecast before their announcement can score the forecaster.
+    resolved = [r for r in resolved if r.p is not None and r.base_rate is not None]
     wins = sum(1 for r in resolved if r.won)
     report = CalibrationReport(n=len(resolved), wins=wins)
     if not resolved:
         report.warnings.append(
-            "no resolved contests with a strong receipt and a pre-announcement prediction: "
+            "no resolved contests with a strong receipt and a pre-announcement forecast: "
             "calibration is unmeasured, so every probability is still a prior"
         )
         return report

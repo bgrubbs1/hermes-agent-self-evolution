@@ -79,10 +79,11 @@ Every evolved variant must pass:
 
 `evolution.contests` is a dependency-free toolkit for agents that enter skill contests. It provides:
 
+- contest discovery from the Devpost API and Hackster data, where zero results is an error;
 - base-rate win probabilities (no hand-set defaults);
 - a receipt-gated outcome ledger;
 - predicted-vs-actual calibration;
-- blind judge panels with a validity gate;
+- blind judge panels with a validity gate, backtests on past contests, and isolated multi-model LLM judges;
 - robustness claims with intervals.
 
 The matching Hermes skill is `skills/contest-calibration/SKILL.md`. See [docs/CONTEST_CALIBRATION.md](docs/CONTEST_CALIBRATION.md).

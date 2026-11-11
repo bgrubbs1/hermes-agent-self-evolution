@@ -62,6 +62,40 @@ Additional safeguards:
   winner-vs-typical gaps measured from public galleries understate how often real
   entries are incomplete. Treat the gallery as a lower bound on field quality.
 
+## Discovery that fails loudly (`discovery.py`)
+
+The bot's scrapers parsed HTML and reported "Found 0 contests". Discovery now reads structured data:
+
+- **Devpost**: the public JSON API (`/api/hackathons`). It gives title, URL, dates, registrations and total
+  prize value. Its `prizes_counts` field is **not** a slot count: on 2026-11-11 it read 14+3 and later 1+0 for
+  the same hackathon. Slot counts come from the hackathon page's prize list (`--prizes N`, one request per
+  second). Those pages sit behind a Cloudflare bot challenge for scripted clients. When it appears, it is
+  reported, not bypassed.
+- **Hackster**: the `ContestsPage` JSON block embedded in `/contests`. robots.txt allows `/contests` and
+  disallows `/projects/*`.
+- **Registry**: a hand-kept JSON list for element14 (refuses automated clients), HeroX, Innocentive, lablab and
+  organizer forms. Entries matching a discovered `contest_id` override its fields.
+
+A source that returns nothing raises `DiscoveryError` with HTTP status, byte counts and parser hits. It never
+returns `[]`. The tests run against trimmed copies of the live responses captured on 2026-11-11.
+
+## Learning faster than one bit per contest
+
+- **Staged results.** `Observation` generalises won/lost to ordered stages. A result can record finalists
+  (`--milestone finalist:20:yes`) or a full-leaderboard `--rank`. Under the same model,
+  P(reach stage k) = sigmoid(logit(slots_k/N) + delta), so a finalist that lost tells the fit far more than a
+  plain loss.
+- **Final field sizes.** Results carry the final `entrants` and `prizes` from the gallery. Each receipted, sourced
+  result then trains the skill offset even without a pre-announcement forecast. Calibration of forecasts
+  still needs one.
+- **Kinds.** `skill`, `application` (selection rounds such as RoadTests, idea/hardware applications and proposal
+  stages) and `sweepstakes` are fitted separately. Applications resolve in weeks, so they add data fastest.
+- **Judge backtests.** `backtest_panel` scores a judge panel on past contests whose winners are published. It
+  reports per-contest winner-vs-entrant AUC, a bootstrap interval over contests, and top-pick hit rate against
+  chance. This is calibration available today; it does not wait for our own results.
+- **Runnable isolated judges.** `make_llm_judge_fn({"j1": "anthropic/...", "j2": "openai/...", "j3": "gemini/..."})`
+  makes one stateless call per judge with only the blind packet. It replaces the persona-judge loop.
+
 ## Using it from the contest bot
 
 ```python

@@ -31,7 +31,8 @@ from typing import Iterable, Optional
 
 from evolution.contests.stats import logit, logsumexp, sigmoid, weighted_quantile
 
-MODEL_VERSION = "base-rate-logit-offset/1"
+MODEL_VERSION = "base-rate-logit-offset/2"
+KINDS = ("skill", "application", "sweepstakes")
 
 
 class UnknownFieldError(ValueError):
@@ -45,17 +46,24 @@ class ContestField:
     ``entrants`` is the total number of competing entries *including ours*.
     Use ``entrants_range`` (low, high) when only an estimate is available.
     Model multi-stage programs (apply -> selected challenger -> prize) as one
-    field per stage.
+    field per stage: ``kind="application"`` for selection stages, which get
+    their own skill offset, and ``kind="sweepstakes"`` for random draws.
     """
 
     contest_id: str
     prizes: int
     entrants: Optional[int] = None
     entrants_range: Optional[tuple[int, int]] = None
-    skill_based: bool = True
+    kind: str = "skill"  # skill | application | sweepstakes
     entrants_source: str = ""
 
+    @property
+    def skill_based(self) -> bool:
+        return self.kind != "sweepstakes"
+
     def __post_init__(self) -> None:
+        if self.kind not in KINDS:
+            raise ValueError(f"kind must be one of {KINDS}")
         if not self.contest_id.strip():
             raise ValueError("contest_id is required")
         if self.prizes < 1:
@@ -116,18 +124,87 @@ class SkillPosterior:
         return math.exp(self.mean)
 
 
+@dataclass(frozen=True)
+class Observation:
+    """One resolved contest for fitting the skill offset.
+
+    ``thresholds`` are stage base rates, strictly decreasing (e.g. finalists/N,
+    then prizes/N); ``reached`` is how many stages the entry got through.  Under
+    the model, P(reach stage k) = sigmoid(logit(t_k) + delta), so a contest with
+    a finalist stage or a published rank carries more information than won/lost.
+    """
+
+    thresholds: tuple[float, ...]
+    reached: int
+
+    def __post_init__(self) -> None:
+        if not self.thresholds:
+            raise ValueError("at least one threshold is required")
+        for t in self.thresholds:
+            if not 0.0 < t <= 1.0:
+                raise ValueError(f"threshold {t} outside (0, 1]")
+        if any(b >= a for a, b in zip(self.thresholds, self.thresholds[1:])):
+            raise ValueError("thresholds must be strictly decreasing (wider stages first)")
+        if not 0 <= self.reached <= len(self.thresholds):
+            raise ValueError("reached must be between 0 and the number of thresholds")
+
+    @classmethod
+    def binary(cls, base_rate: float, won: bool) -> "Observation":
+        return cls((float(base_rate),), 1 if won else 0)
+
+    @classmethod
+    def staged(cls, entrants: int, stages: list[tuple[int, bool]]) -> "Observation":
+        """``stages`` = [(slots, reached), ...] from widest to narrowest, e.g. [(20, True), (3, False)]."""
+        if entrants < 1:
+            raise ValueError("entrants must be >= 1")
+        ordered = sorted(stages, key=lambda s: -s[0])
+        reached_flags = [r for _, r in ordered]
+        if any(later and not earlier for earlier, later in zip(reached_flags, reached_flags[1:])):
+            raise ValueError("cannot reach a narrower stage without the wider one")
+        thresholds = tuple(min(1.0, slots / entrants) for slots, _ in ordered)
+        # equal capped thresholds (slots >= entrants) collapse: keep strictly decreasing ones
+        kept, kept_reached = [], 0
+        for t, r in zip(thresholds, reached_flags):
+            if kept and t >= kept[-1]:
+                continue
+            kept.append(t)
+            kept_reached += 1 if r else 0
+        return cls(tuple(kept), min(kept_reached, len(kept)))
+
+    @classmethod
+    def from_rank(cls, rank: int, entrants: int) -> "Observation":
+        """Full leaderboard: finished exactly ``rank`` of ``entrants``."""
+        if not 1 <= rank <= entrants:
+            raise ValueError("rank must be between 1 and entrants")
+        if rank == 1:
+            return cls((1.0 / entrants,), 1)
+        return cls((rank / entrants, (rank - 1) / entrants), 1)
+
+    def log_likelihood(self, delta: float) -> float:
+        reach = [1.0] + [sigmoid(logit(t) + delta) for t in self.thresholds] + [0.0]
+        p = reach[self.reached] - reach[self.reached + 1]
+        return math.log(max(p, 1e-300))
+
+
+def _as_observation(item) -> Observation:
+    if isinstance(item, Observation):
+        return item
+    base_rate, won = item
+    return Observation.binary(base_rate, bool(won))
+
+
 def fit_skill_offset(
-    history: Iterable[tuple[float, bool]],
+    history: Iterable,
     *,
     prior_sd: float = 1.0,
     prior_mean: Optional[float] = None,
     grid_size: int = 241,
     span_sd: float = 6.0,
 ) -> SkillPosterior:
-    """Posterior over ``delta`` from resolved skill contests.
+    """Posterior over ``delta`` from resolved contests.
 
-    ``history`` holds ``(base_rate_at_prediction_time, won)`` pairs taken only
-    from contests with a verified submission and a published result.
+    ``history`` holds :class:`Observation` objects or ``(base_rate, won)`` pairs,
+    taken only from contests with a verified submission and a published result.
     """
     if prior_sd <= 0:
         raise ValueError("prior_sd must be positive")
@@ -135,30 +212,25 @@ def fit_skill_offset(
         raise ValueError("grid_size must be >= 3")
     if prior_mean is None:
         prior_mean = -(prior_sd**2) / 2.0
-    history = [(float(b), bool(y)) for b, y in history]
-    for b, _ in history:
-        if not 0.0 < b <= 1.0:
-            raise ValueError(f"base rate {b} outside (0, 1]")
+    observations = [_as_observation(h) for h in history]
 
     lo = prior_mean - span_sd * prior_sd
     hi = prior_mean + span_sd * prior_sd
     grid = [lo + (hi - lo) * i / (grid_size - 1) for i in range(grid_size)]
-    base_logits = [(logit(b), y) for b, y in history]
 
     log_w = []
     for d in grid:
         lp = -0.5 * ((d - prior_mean) / prior_sd) ** 2
-        for lb, y in base_logits:
-            p = sigmoid(lb + d)
-            lp += math.log(max(p, 1e-300)) if y else math.log(max(1.0 - p, 1e-300))
+        for obs in observations:
+            lp += obs.log_likelihood(d)
         log_w.append(lp)
     norm = logsumexp(log_w)
     weights = tuple(math.exp(x - norm) for x in log_w)
     return SkillPosterior(
         grid=tuple(grid),
         weights=weights,
-        n_obs=len(history),
-        wins=sum(1 for _, y in history if y),
+        n_obs=len(observations),
+        wins=sum(1 for o in observations if o.reached == len(o.thresholds)),
         prior_mean=prior_mean,
         prior_sd=prior_sd,
     )
@@ -171,12 +243,16 @@ class WinEstimate:
     p_low: float
     p_high: float
     base_rate: float
-    skill_based: bool
+    kind: str
     skill_offset_mean: float
     n_history: int
     evidence_class: str
     model_version: str = MODEL_VERSION
     notes: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def skill_based(self) -> bool:
+        return self.kind != "sweepstakes"
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -239,6 +315,8 @@ def estimate_win_probability(
         notes.append("random draw: skill history and judgment do not apply")
     elif skill.n_obs == 0:
         evidence = "base_rate_only"
+        if contest.kind == "application":
+            evidence = "base_rate_only(application)"
         notes.append("no resolved contests yet: interval is the prior on skill, not a measurement")
     else:
         evidence = f"base_rate+history(n={skill.n_obs},wins={skill.wins})"
@@ -259,7 +337,7 @@ def estimate_win_probability(
         p_low=p_low,
         p_high=p_high,
         base_rate=contest.base_rate(),
-        skill_based=contest.skill_based,
+        kind=contest.kind,
         skill_offset_mean=skill.mean if contest.skill_based else 0.0,
         n_history=skill.n_obs,
         evidence_class=evidence,

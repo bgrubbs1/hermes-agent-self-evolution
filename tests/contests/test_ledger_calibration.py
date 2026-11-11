@@ -2,7 +2,7 @@
 
 import pytest
 
-from evolution.contests.base_rates import ContestField, estimate_win_probability
+from evolution.contests.base_rates import ContestField, Observation, estimate_win_probability
 from evolution.contests.calibration import calibration_report
 from evolution.contests.ledger import Ledger, LedgerError, ResolvedContest, parse_time
 
@@ -48,7 +48,8 @@ class TestAudit:
         ledger.record_result("c", "lost", "https://x/winners", announced_at=T2)
         audit = ledger.audit()
         assert len(audit.resolved) == 1 and not audit.resolved[0].won
-        assert ledger.skill_history() == [(pytest.approx(0.05), False)]
+        (obs,) = ledger.skill_history()
+        assert obs.thresholds == (pytest.approx(0.05),) and obs.reached == 0
 
     def test_screenshot_receipt_is_unconfirmed_and_excluded(self, ledger):
         ledger.record_prediction(_est("vr"), made_at=T0)
@@ -60,11 +61,20 @@ class TestAudit:
         assert "form screenshot" in audit.excluded["vr"]
         assert audit.verified_wins == 0
 
-    def test_hindsight_prediction_excluded(self, ledger):
+    def test_hindsight_prediction_not_used(self, ledger):
         ledger.record_submission("c", "confirmation_email", "m", submitted_at=T1)
         ledger.record_result("c", "won", "https://x/w", announced_at=T1)
         ledger.record_prediction(_est("c"), made_at=T2)
-        assert "before the result" in ledger.audit().excluded["c"]
+        assert "no field size" in ledger.audit().excluded["c"]
+
+    def test_hindsight_prediction_not_scored_but_result_still_learns(self, ledger):
+        ledger.record_submission("c", "confirmation_email", "m", submitted_at=T1)
+        ledger.record_result("c", "won", "https://x/w", announced_at=T1, entrants=40, prizes=2)
+        ledger.record_prediction(_est("c"), made_at=T2)
+        audit = ledger.audit()
+        (r,) = audit.resolved
+        assert r.p is None and audit.forecasted == []
+        assert r.observation.thresholds == (pytest.approx(0.05),) and r.observation.reached == 1
 
     def test_latest_pre_announcement_prediction_used(self, ledger):
         ledger.record_prediction(_est("c", entrants=100), made_at=T0)
@@ -73,6 +83,7 @@ class TestAudit:
         ledger.record_result("c", "won", "https://x/w", announced_at=T2)
         (r,) = ledger.resolved()
         assert r.base_rate == pytest.approx(0.1)
+        assert r.p is not None
 
     def test_conflicting_results_excluded(self, ledger):
         ledger.record_prediction(_est("c"), made_at=T0)
@@ -91,7 +102,10 @@ class TestAudit:
 
 
 def _resolved(p, base, won):
-    return ResolvedContest("c", p, base, True, won, "won" if won else "lost", T0)
+    return ResolvedContest(
+        "c", "skill", won, "won" if won else "lost", Observation.binary(base, won), p=p, base_rate=base,
+        predicted_at=T0,
+    )
 
 
 class TestCalibration:
@@ -119,3 +133,64 @@ class TestCalibration:
         assert any("noise" in w for w in rep.warnings)
         for b in rep.bins:
             assert b.observed_ci[0] <= b.observed_rate <= b.observed_ci[1]
+
+
+class TestStagedResultsAndAttempts:
+    def test_milestones_build_staged_observation(self, ledger):
+        ledger.record_submission("c", "confirmation_email", "m", submitted_at=T1)
+        ledger.record_result("c", "lost", "https://x/w", announced_at=T2, entrants=200, prizes=3,
+                             milestones=[{"name": "finalist", "slots": 20, "reached": True}])
+        (r,) = ledger.resolved()
+        assert r.observation.thresholds == (pytest.approx(0.1), pytest.approx(0.015))
+        assert r.observation.reached == 1
+
+    def test_rank_result(self, ledger):
+        ledger.record_submission("k", "platform_api", "kaggle:sub:1", submitted_at=T1)
+        ledger.record_result("k", "lost", "https://x/lb", announced_at=T2, entrants=1000, rank=57)
+        (r,) = ledger.resolved()
+        assert r.observation.thresholds == (pytest.approx(0.057), pytest.approx(0.056))
+
+    def test_inconsistent_milestone_excluded(self, ledger):
+        ledger.record_submission("c", "confirmation_email", "m", submitted_at=T1)
+        ledger.record_result("c", "won", "https://x/w", announced_at=T2, entrants=200, prizes=3,
+                             milestones=[{"name": "finalist", "slots": 20, "reached": False}])
+        assert "inconsistent" in ledger.audit().excluded["c"]
+
+    def test_attempts_are_listed_not_counted(self, ledger):
+        ledger.record_attempt("sw1", "entry form submitted; no confirmation email", kind="sweepstakes",
+                              attempted_at="unknown")
+        ledger.record_result("sw1", "lost", "https://x/w", announced_at=T2)
+        audit = ledger.audit()
+        assert audit.unreceipted_attempts == ["sw1"]
+        assert "without any receipt" in audit.excluded["sw1"]
+        assert audit.resolved == []
+
+    def test_unknown_submission_time_allowed(self, ledger):
+        rec = ledger.record_submission("old", "form_screenshot", "shots/", submitted_at="unknown")
+        assert rec["submitted_at"] == "unknown"
+        with pytest.raises(LedgerError):
+            ledger.record_submission("old", "form_screenshot", "shots/", submitted_at="last week")
+
+    def test_kinds_learn_separately(self, ledger):
+        ledger.record_submission("app", "confirmation_email", "m", kind="application", submitted_at=T1)
+        ledger.record_result("app", "selected", "msg-2", announced_at=T2, entrants=50, prizes=10)
+        assert ledger.skill_history("skill") == []
+        assert len(ledger.skill_history("application")) == 1
+        assert ledger.skill_history("sweepstakes") == []
+
+    def test_selection_without_field_size_still_counts_as_verified(self, ledger):
+        ledger.record_submission("app", "confirmation_email", "m", kind="application", submitted_at=T1)
+        ledger.record_result("app", "selected", "msg-2", announced_at=T2)
+        audit = ledger.audit()
+        assert audit.verified_wins == 1 and "no field size" in audit.excluded["app"]
+
+    def test_v1_ledger_records_still_read(self, ledger):
+        import json
+        with open(ledger.path, "w") as fh:
+            fh.write(json.dumps({"type": "prediction", "contest_id": "c", "p_mean": 0.05, "p_low": 0.01,
+                                 "p_high": 0.1, "base_rate": 0.05, "skill_based": False,
+                                 "evidence_class": "chance_only", "made_at": T0}) + "\n")
+        ledger.record_submission("c", "confirmation_email", "m", submitted_at=T1)
+        ledger.record_result("c", "lost", "https://x/w", announced_at=T2)
+        (r,) = ledger.resolved()
+        assert r.kind == "sweepstakes"

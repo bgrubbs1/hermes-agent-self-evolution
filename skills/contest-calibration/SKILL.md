@@ -1,110 +1,123 @@
 ---
 name: contest-calibration
-description: Enter skill contests and hackathons (Hackster, Devpost, element14, PCBWay, Kaggle-style, sweepstakes) with honest odds and checkable evidence. Use when choosing which contests to enter, estimating win probability, judging an entry before submission, logging submissions/results, or reporting contest status. Replaces hand-set probabilities, self-graded persona judges, and unreceipted "submitted" claims with the evolution.contests tools.
+description: Find, enter and learn from skill contests, hackathons, hardware applications and sweepstakes (Devpost, Hackster, element14, HeroX, Innocentive, lablab, Kaggle-style) with honest odds and checkable evidence. Use when discovering contests, choosing which to enter, estimating win probability, judging an entry before submission, logging receipts and results, or reporting contest status. Replaces hand-set probabilities, self-graded persona judges, HTML scrapers that report "0 contests", and unreceipted "submitted" claims with the evolution.contests tools.
 ---
 
 # Contest Calibration
 
 No tool ensures a win. Contests have human judges and other entrants. This skill
-does what can be done: spend hours where the odds are best, ship complete
-entries, test them the way judges will, and learn from every result, losses
-included.
+does what can be done: find contests, spend hours where the odds are best, ship
+complete entries, test them the way judges will, and learn from every result,
+losses included.
 
-The tools live in `hermes-agent-self-evolution` (`evolution.contests`). Ledger:
-`~/.hermes/contests/ledger.jsonl` unless the user names another.
+Setup (once per machine): `pip install -e <path>/hermes-agent-self-evolution`.
+Ledger: `~/.hermes/contests/ledger.jsonl`. Registry: `~/.hermes/contests/registry.json`.
+Below, `C` means `python -m evolution.contests.cli` and `L` the ledger path.
 
 ## Hard rules
 
-1. **Never type a probability.** Every P(win) comes from
-   `python -m evolution.contests.cli predict`. If the field size is unknown, the
-   answer is "unknown". Go observe it (platform counter, applicant count, last
-   edition's gallery); never use a default.
+1. **Never type a probability.** Every P(win) comes from `C predict`. If the
+   field size is unknown the answer is "unknown": observe it (platform counter,
+   gallery count, applicant count, last edition); never use a default.
 2. **Never call self-graded scores independent.** Personas you wrote, or judges
-   that saw this conversation, are `self_graded`. Report them as drafts, not as
-   evidence.
-3. **No receipt, no submission.** Record a submission only with a confirmation
-   email, confirmation page, platform entry URL or API record. A screenshot of a
-   filled form is `form_screenshot` and stays UNCONFIRMED.
-4. **Record every result**, including losses, with the announcement URL and time.
-5. **No win guarantees in any outward text.** Run
-   `python -m evolution.contests.cli lint <file>` on status reports and pitches.
-6. Probabilities are always reported with their interval and evidence class,
-   e.g. `P(win) 1.9% (90% 0.4%-6.8%), evidence: base_rate_only`.
+   that saw this conversation, are `self_graded`: drafts, not evidence.
+3. **No receipt, no submission.** `C submit` only with a confirmation email,
+   confirmation page, platform entry URL or API record. A filled-form screenshot
+   is `form_screenshot` (unconfirmed). Nothing at all: `C attempt`.
+4. **Record every result**, losses included, with the announcement source and
+   time, plus final `--entrants` and `--prizes` (galleries show both).
+5. **Never bypass bot protection.** If a site shows a bot challenge or refuses
+   automated clients, stop and take the value from the page by hand into the
+   registry. Do not spoof browsers or change user agents to get through.
+6. **No win guarantees in outward text.** Run `C lint <file>` on reports and pitches.
+7. Report probabilities with interval and evidence class, e.g.
+   `P(win) 1.3% (90% 0.06%-5.1%), evidence: base_rate+history(n=6,wins=0)`.
 
 ## Workflow
 
-### 1. Select (before any work)
+### 1. Discover
 
-- Verify eligibility and rules from the official page (region, age, team size,
+- `C discover` reads the Devpost API and Hackster's contests data. A source that
+  returns nothing raises an error with diagnostics: report it, never "no contests".
+- `C discover --prizes 10` also reads up to 10 Devpost hackathon pages (1 per
+  second) to count prize slots. A bot challenge there is reported, not bypassed.
+- Sites without usable data (element14, HeroX, Innocentive, lablab, organizer
+  forms): add entries to the registry. A registry entry whose `contest_id`
+  matches a discovered contest overrides fields such as `prize_slots`.
+- Organizer emails (confirmations, reminders, "winners announced") are a
+  discovery and receipt source: search mail for them.
+
+### 2. Select (before any work)
+
+- Verify eligibility and rules on the official page (region, age, team,
   originality, license, video length, deadline with timezone).
-- Count the field. `--entrants` includes us. Use `--entrants-range LOW HIGH`
-  when only an estimate exists, and cite it with `--entrants-source`.
-- Model multi-stage programs (apply, then selected challengers, then prizes) as
-  one prediction per stage. The application stage has its own odds.
-- Sweepstakes / random draws: add `--sweepstakes`. Skill does not apply.
-- Predict and record:
-  `python -m evolution.contests.cli predict --ledger L --contest-id ID --prizes N --entrants M --entrants-source URL --deadline ISO`
-- Rank candidates by EV per hour (`expected_value_per_hour`). Show the
-  pessimistic `ev_per_hour_low` alongside the mean.
-- A judgment shift (`--shift`, log-odds) needs `--reason` with concrete,
-  checkable facts (e.g. "gallery shows 4 of 31 entries meet the video rule").
-  It is labelled `+judgment_shift` and is not evidence.
+- Count prize slots you can actually win (exclude sponsor-tool tracks you will
+  not use). `--entrants` includes us; `--entrants-range LOW HIGH` when only
+  registrations are known; cite `--entrants-source`.
+- `--kind skill` (default), `--kind application` for selection stages (RoadTests,
+  idea/hardware applications, proposal rounds), `--kind sweepstakes` for draws.
+  Each kind learns its own offset; sweepstakes never use skill.
+- Predict and record before the deadline:
+  `C predict --ledger L --contest-id ID --prizes N --entrants-range LO HI --entrants-source SRC --deadline ISO`
+- Rank by EV per hour (`expected_value_per_hour`); show `ev_per_hour_low` too.
+- `--shift` (log-odds) needs `--reason` with checkable facts; it is labelled
+  `+judgment_shift` and is not evidence.
 
-### 2. Build to the rubric
+### 3. Build to the rubric
 
-- Write the official rubric down verbatim. Map each criterion to a concrete
-  artifact (repo, BOM, schematic, video, license file, limits section).
-- Reuse assets across contests only where rules allow it (originality clauses).
+- Copy the official rubric verbatim; map each criterion to a concrete artifact
+  (repo, BOM, schematic, video, license file, limits section).
+- Reuse assets across contests only where originality rules allow.
 
-### 3. Judge it blind (before submitting)
+### 4. Judge it blind (before submitting)
 
-Use `evolution.contests.judges`:
+- First check the panel itself: `backtest_panel` on >=5 past contests with
+  published winners (winners + typical entrants, placement words scrubbed).
+  If its AUC interval includes 0.5, the panel is no better than chance: stop
+  using its scores.
+- Then `make_blind_batch` with our entry, >=3 real winners, >=3 typical entrants
+  and >=1 control (our entry with a planted defect: license removed, video over
+  the limit, BOM missing).
+- Judges: `make_llm_judge_fn({...})` with >=3 models from different families
+  (e.g. anthropic/..., openai/..., gemini/...); each call is isolated. Humans
+  count too. Never this conversation.
+- `evaluate_panel` decides whether the verdict counts (winner-vs-entrant AUC >=
+  0.75, ICC >= 0.4, defect detection >= 0.8, not self-graded or reused). If NOT
+  VALID, say so and do not cite the scores. Report rank among real winners and
+  entrants with its interval, never "95/100".
+- Respect robots.txt when collecting references (Hackster disallows `/projects/*`).
 
-- Collect >=3 **real past winners** and >=3 **typical entrants** from the same or
-  a comparable contest. Scrub placement words ("winner", "1st place",
-  "finalist"); `make_blind_batch` refuses leaky text.
-- Add >=1 **control**: a copy of our entry with a planted defect (license
-  removed, video over the limit, BOM missing). This catches judges that do not
-  read carefully.
-- Judges: >=3, isolated from this conversation (fresh subagents, separate API
-  calls, or humans), preferably from different model families. Each gets only
-  the packet prompt.
-- `evaluate_panel` then decides whether the panel's opinion counts:
-  real winners must outrank typical entrants (AUC >= 0.75), judges must agree
-  (ICC >= 0.4), planted defects must be caught (>= 0.8), and the panel must not
-  be self-graded or reused from the optimisation loop.
-- If the panel is NOT VALID, say so and do not cite its scores.
-- Report: where the entry ranks among real winners and entrants, with the
-  bootstrap interval. Never report "95/100".
+### 5. Iterate (bounded)
 
-### 4. Iterate (bounded)
-
-- Fix against the rubric and the panel feedback. Iterate with an optimisation
-  judge set; score the final version only with `split_judges` holdout judges.
-- Stop after 2 consecutive iterations with no gain on the holdout panel, or when
-  marginal hours beat another contest's EV per hour.
-- Robustness: run >=20 fresh adversarial inputs a judge might try and report
+- Iterate against `split_judges` optimisation judges; score the final version
+  only with the holdout judges.
+- Stop after 2 iterations without holdout gain, or when the hours would earn
+  more EV in another contest.
+- Robustness: >=20 fresh adversarial inputs a judge might try; put
   `summarize_trials(...).claim("fresh judge-style prompts")` in the entry.
 
-### 5. Submit
+### 6. Submit
 
-- Final compliance checklist against the rules page, then submit.
-- Record the receipt:
-  `python -m evolution.contests.cli submit --ledger L --contest-id ID --receipt-kind confirmation_email --receipt-ref MSG_ID --receipt-file saved.eml`
+- Final compliance pass against the rules page, then submit and wait for the
+  organizer's confirmation.
+  `C submit --ledger L --contest-id ID --receipt-kind confirmation_email --receipt-ref gmail:MSG_ID`
+- "Submission started" emails are not confirmations: finish the submission.
 
-### 6. Close the loop
+### 7. Close the loop
 
-- When results post:
-  `python -m evolution.contests.cli result --ledger L --contest-id ID --outcome won|placed|lost|disqualified --source URL --announced-at ISO`
-- Monthly: `python -m evolution.contests.cli report --ledger L`. The forecaster has
-  learned something only if its Brier skill score against the naive base rate is
-  above 0 over >=20 resolved contests. Until then every estimate is mostly
-  prior. Say so.
+- On results: `C result --ledger L --contest-id ID --outcome won|placed|lost|disqualified|selected|not_selected --source URL --announced-at ISO --entrants N --prizes K`
+  Add `--milestone finalist:20:yes` for wider stages or `--rank R` for full
+  leaderboards: each makes one result count for more.
+- Check the gallery yourself for whether our project is a winner. Similar names
+  are not proof: open the winning project and check its team or repo.
+- Monthly `C report --ledger L`. The forecaster has learned something only if
+  its Brier skill score against the naive base rate is above 0 over >=20
+  forecast contests. Until then every estimate is mostly prior. Say so.
 
 ## Status report format
 
 ```
-Contest | stage | P(win) mean (90%) | evidence | EV/h | receipt | result
+Contest | kind | stage | P(win) mean (90%) | evidence | EV/h | receipt | result
 ```
 
-Counts come from `report --json`. Never from memory.
+Counts come from `C report --json`. Never from memory.
